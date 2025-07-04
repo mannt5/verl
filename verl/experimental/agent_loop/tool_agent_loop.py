@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.tools.utils.tool_registry import initialize_tools_from_config
-from verl.utils.debug import simple_timer
+from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -119,14 +119,18 @@ class ToolAgentLoop(AgentLoopBase):
         request_id = uuid4().hex
         prompt_ids = await self.loop.run_in_executor(
             None,
-            lambda: self.tokenizer.apply_chat_template(messages, tools=self.tool_schemas, add_generation_prompt=True, tokenize=True),
+            lambda: self.tokenizer.apply_chat_template(
+                messages, tools=self.tool_schemas, add_generation_prompt=True, tokenize=True
+            ),
         )
         response_mask = []
 
         user_turns, assistant_turns = 0, 0
         while True:
             with simple_timer("generate_sequences", metrics):
-                response_ids = await self.server_manager.generate(request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params)
+                response_ids = await self.server_manager.generate(
+                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+                )
             prompt_ids += response_ids
             response_mask += [1] * len(response_ids)
             assistant_turns += 1
@@ -137,6 +141,10 @@ class ToolAgentLoop(AgentLoopBase):
 
             # reach max assistant turns
             if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
+                break
+
+            # reach max user turns
+            if self.max_user_turns and user_turns >= self.max_user_turns:
                 break
 
             # no tool calls
@@ -156,16 +164,20 @@ class ToolAgentLoop(AgentLoopBase):
             # append tool_response_ids
             tool_response_ids = await self.loop.run_in_executor(
                 None,
-                lambda messages=tool_responses: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True),
+                lambda messages=tool_responses: self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True
+                ),
             )
             tool_response_ids = tool_response_ids[len(self.system_prompt) :]
+
+            # NOTE: last turn should not be user turn, or the EOS token reward
+            # can't be propagated to previous token in GAE.
+            if len(response_mask) + len(tool_response_ids) >= self.response_length:
+                break
+
             prompt_ids += tool_response_ids
             response_mask += [0] * len(tool_response_ids)
             user_turns += 1
-
-            # reach max user turns or max response length
-            if (self.max_user_turns and user_turns >= self.max_user_turns) or len(response_mask) >= self.response_length:
-                break
 
         response_ids = prompt_ids[-len(response_mask) :]
         prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
