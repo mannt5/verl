@@ -128,6 +128,10 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
+    tool_rewards: Optional[float] = None
+    """Tool rewards for the trajectory."""
+    tool_metrics: Optional[list[dict[str, Any]]] = None
+    """Tool metrics for the trajectory."""
     reward_score: Optional[float] = None
     """Reward score for the trajectory."""
     num_turns: int = 0
@@ -280,6 +284,24 @@ class RewardManagerWorker:
             **{k: np.array([v]) for k, v in kwargs.items()},
             "__num_turns__": np.array([output.num_turns]),
         }
+        # add tool rewards and tool metrics into extra_info within non_tensor_batch
+        if output.tool_rewards is not None or output.tool_metrics is not None:
+            # Get existing extra_info or create empty dict
+            extra_info = kwargs.get("extra_info", {})
+            if isinstance(extra_info, np.ndarray):
+                extra_info = extra_info.item() if extra_info.size == 1 else {}
+            elif not isinstance(extra_info, dict):
+                extra_info = {}
+
+            # Add tool rewards and metrics to extra_info
+            if output.tool_rewards is not None:
+                extra_info["tool_rewards"] = output.tool_rewards
+            if output.tool_metrics is not None:
+                extra_info["tool_metrics"] = output.tool_metrics
+
+            # Store the updated extra_info back in non_tensor_batch
+            non_tensor_batch["extra_info"] = np.array([extra_info], dtype=object)
+
         data = DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
@@ -534,6 +556,8 @@ class AgentLoopWorker:
                 reward_score=output.reward_score,
                 num_turns=output.num_turns,
                 metrics=output.metrics,
+                tool_rewards=output.tool_rewards,
+                tool_metrics=output.tool_metrics,
             )
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
@@ -579,6 +603,20 @@ class AgentLoopWorker:
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+
+        # Add tool rewards and tool metrics to extra_info within non_tensor_batch
+        tool_rewards_list = [input.tool_rewards for input in inputs]
+        tool_metrics_list = [input.tool_metrics for input in inputs]
+        if any(tr is not None for tr in tool_rewards_list) or any(tm is not None for tm in tool_metrics_list):
+            extra_info_list = []
+            for i, input_item in enumerate(inputs):
+                extra_info = {}
+                if input_item.tool_rewards is not None:
+                    extra_info["tool_rewards"] = input_item.tool_rewards
+                if input_item.tool_metrics is not None:
+                    extra_info["tool_metrics"] = input_item.tool_metrics
+                extra_info_list.append(extra_info)
+            non_tensor_batch["extra_info"] = np.array(extra_info_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": metrics})
